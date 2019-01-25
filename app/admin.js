@@ -8,10 +8,8 @@ const pjson = require('../package.json');
 const fs = require('fs');
 const crypto = require('crypto');
 
-const db = require('./db.js');
-const MasterKey = require('./models/masterkey.js');
+let db, MasterKey, WalletKey;
 const signingTool = require('./sign.js');
-const WalletKey = require('./models/walletkey.js');
 const utils = require('./utils');
 const bitcoinMessage = require('bitcoinjs-message');
 
@@ -105,6 +103,15 @@ setVerificationCommand.addArgument(
     action: 'store',
     nargs: '+',
     help: 'verification information to store with the wallet\'s backup key'
+  }
+);
+
+const recoveryInfoCommand = subparsers.addParser('recoveryInfo', { addHelp: true });
+recoveryInfoCommand.addArgument(
+  ['file'],
+  {
+    action: 'store',
+    help: 'the path to the recovery file that bitgo provided'
   }
 );
 
@@ -231,8 +238,6 @@ const saveKeys = co(function *(keys, type) {
     return;
   }
 
-
-
   const keyDocs = keys
     .filter( key => validateKey(key, type))
     .map( key => ({
@@ -272,10 +277,48 @@ const handleImportKeys = co(function *(args) {
     throw new Error('please specify the path to a CSV file containing the public keys to import');
   }
 
-  const keys = JSON.parse(fs.readFileSync(path, { encoding: 'utf8' }));
+  let keys = JSON.parse(fs.readFileSync(path, { encoding: 'utf8' }));
+
+  keys = formatKeysByType(keys, type);
 
   yield saveKeys(keys, type);
 });
+
+/**
+ * This function handles a new type of key-import format
+ * For example, a key can be imported as such:
+ * {
+ *   pub: "xpub20412049182341234"
+ *   xlmpub: "GSLKJASDFJASLFASDFAS"
+ *   signature: "IK/alkjELASJFLAKJSDFLAKSFASDFW=="
+ *   xlmSignature: "KOPASIK------PSDIFAPSDFOAF"
+ *   path: "100"
+ * }
+ * If this key comes in, we can save it either as type xpub or xlm (depending on what the admin specifies on the command line)
+ * If the above key is imported as type 'xlm', we will change it to the following format:
+ * {
+ *   pub: "GSLKJASDFJASLFASDFAS"
+ *   signature: "KOPASIK------PSDIFAPSDFOAF"
+ *   path: "100"
+ * }
+ * Notice that we replaced the pub and signature fields with the XLM info.
+ * Alternatively, if the key is specified to be an xpub, we would just remove the XLM info and continue as normal
+ */
+const formatKeysByType = function(keys, type) {
+  // if using the old format, don't do anything here, just return the keys
+  if (!keys[0].xlmpub) {
+    return keys;
+  }
+  const formattedkeys = [];
+  _.forEach(keys, function(key) {
+    formattedkeys.push({
+      pub: type === 'xlm' ? key.xlmpub : key.pub,
+      signature: type === 'xlm' ? key.xlmSignature : key.signature,
+      path: key.path
+    });
+  })
+  return formattedkeys;
+}
 
 const handleDeriveKey = function(args) {
   try {
@@ -368,11 +411,32 @@ const handleVerification = co(function *(args) {
   }
 });
 
+const handleRecoveryInfo = co(function *(args){
+  const json = JSON.parse(fs.readFileSync(args.file));
+  const pub = json.backupKey;
+  const walletkey = yield WalletKey.findOne({ pub });
+  const masterkey = yield MasterKey.findOne({ pub: walletkey.masterKey });
+  json.masterkey = masterkey.pub;
+  json.masterkeypath = masterkey.path;
+  json.walletkeypath = walletkey.path;
+  const filename = args.file.substring(0,args.file.length - 5) + '-prepared.json';
+  console.log('got info... writing file ' + filename);
+  fs.writeFileSync(filename, JSON.stringify(json, null, 2));
+  console.log('done.');
+});
+
+const requireDB = function() {
+  MasterKey = require('./models/masterkey.js');
+  WalletKey = require('./models/walletkey.js');
+  db = require('./db.js');
+}
+
 const run = co(function *(testArgs) {
   const args = parser.parseArgs(testArgs);
 
   switch (args.cmd) {
     case 'import':
+      requireDB();
       yield handleImportKeys(args);
       break;
     case 'sign':
@@ -388,12 +452,18 @@ const run = co(function *(testArgs) {
       handleGenerateHDSeed();
       break;
     case 'verification':
+      requireDB();
       yield handleVerification(args);
       break;
+    case 'recoveryInfo':
+      requireDB();
+      yield handleRecoveryInfo(args);
   }
 
-  db.connection.close();
+  if (db && db.connection) {
+    db.connection.close();
+  }
 });
 
 // For admin script and unit testing of functions
-module.exports = { run, validateKey, saveKeys, db };
+module.exports = { run, validateKey, saveKeys, db , requireDB };

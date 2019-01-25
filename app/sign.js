@@ -14,7 +14,10 @@ const utxoNetworks = {
   zec: utxoLib.networks.zcash,
   dash: utxoLib.networks.dash,
   tltc: utxoLib.networks.litecoin,
-  tbtc: utxoLib.networks.testnet
+  tbtc: utxoLib.networks.testnet,
+  tbch: utxoLib.networks.bitcoincashTestnet,
+  tzec: utxoLib.networks.zcashTest,
+  tdash: utxoLib.networks.dashTest,
 };
 
 const coinDecimals = {
@@ -30,7 +33,10 @@ const coinDecimals = {
   teth: 18,
   txrp: 6,
   tltc: 8,
-  txlm: 7
+  txlm: 7,
+  tbch: 8,
+  tzec: 8,
+  tdash: 8,
 };
 
 const TEN = new BN(10);
@@ -60,7 +66,7 @@ const getHDNodeAndVerify = function(xprv, expectedXpub) {
   let node;
 
   try {
-    node = prova.HDNode.fromBase58(xprv);
+    node = utxoLib.HDNode.fromBase58(xprv);
   } catch (e) {
     throw new Error('invalid private key');
   }
@@ -84,7 +90,8 @@ const handleSignUtxo = function(recoveryRequest, key, skipConfirm) {
     throw new Error(`Unsupported coin: ${recoveryRequest.coin}`);
   }
 
-  const transaction = utxoLib.Transaction.fromHex(recoveryRequest.transactionHex, network);
+  const txHex = getTransactionHexFromRequest(recoveryRequest);
+  const transaction = utxoLib.Transaction.fromHex(txHex, network);
 
   const outputs = transaction.outs.map(out => ({
     address: utxoLib.address.fromOutputScript(out.script, network),
@@ -103,45 +110,63 @@ const handleSignUtxo = function(recoveryRequest, key, skipConfirm) {
   // force override network as we use btc mainnet xpubs for all utxo coins
   backupKeyNode.keyPair.network = network;
 
+  transaction.ins.forEach(function (input, i) {
+    transaction.ins[i].value = recoveryRequest.inputs[i].amount;
+  })
+
   const txBuilder = utxoLib.TransactionBuilder.fromTransaction(transaction, network);
 
   _.forEach(recoveryRequest.inputs, function(input, i) {
-    const isBech32 = !input.redeemScript;
-    const isSegwit = !!input.witnessScript;
 
-    // chain paths come from the SDK with a leading /, which is technically not allowed by BIP32
+    // Set up chain path: chain paths come from the SDK with a leading /, which is technically not allowed by BIP32
     if (input.chainPath.startsWith('/')) {
       input.chainPath = input.chainPath.slice(1);
     }
 
+    // Derive signing key from chain path
     const derivedHDNode = backupKeyNode.derivePath(input.chainPath);
-
     console.log(`Signing input ${ i + 1 } of ${ recoveryRequest.inputs.length } with ${ derivedHDNode.neutered().toBase58() } (${ input.chainPath })`);
 
-    if (isBech32) {
+    // Handle BCH
+    if (recoveryRequest.coin === 'bch' || recoveryRequest.coin === 'tbch') {
+      const redeemScript = new Buffer(input.redeemScript, 'hex');
+      txBuilder.sign(i, derivedHDNode.keyPair, redeemScript, utxoLib.Transaction.SIGHASH_BITCOINCASHBIP143 | utxoLib.Transaction.SIGHASH_ALL, input.amount);
+      return; // in a Lodash forEach loop, 'return' operates like 'continue' does in a regular javascript loop. It finishes this iteration and moves to the next iteration
+    }
+
+    // Handle Bech32
+    if (!input.redeemScript) {
       const witnessScript = Buffer.from(input.witnessScript, 'hex');
       const witnessScriptHash = utxoLib.crypto.sha256(witnessScript);
       const prevOutScript = utxoLib.script.witnessScriptHash.output.encode(witnessScriptHash);
       txBuilder.sign(i, derivedHDNode.keyPair, prevOutScript, utxoLib.Transaction.SIGHASH_ALL, input.amount, witnessScript);
-    } else {
-      const redeemScript = new Buffer(input.redeemScript, 'hex');
-
-      if (isSegwit) {
-        const witnessScript = new Buffer(input.witnessScript, 'hex');
-        txBuilder.sign(i, derivedHDNode.keyPair, redeemScript, utxoLib.Transaction.SIGHASH_ALL, input.amount, witnessScript)
-      } else {
-        txBuilder.sign(i, derivedHDNode.keyPair, redeemScript, utxoLib.Transaction.SIGHASH_ALL);
-      }
+      return;
     }
+
+    // Handle Wrapped Segwit
+    const redeemScript = new Buffer(input.redeemScript, 'hex');
+    if (input.witnessScript) {
+      const witnessScript = new Buffer(input.witnessScript, 'hex');
+      txBuilder.sign(i, derivedHDNode.keyPair, redeemScript, utxoLib.Transaction.SIGHASH_ALL, input.amount, witnessScript);
+      return;
+    }
+
+    // Handle all other requests
+    txBuilder.sign(i, derivedHDNode.keyPair, redeemScript, utxoLib.Transaction.SIGHASH_ALL, input.amount);
   });
 
   return txBuilder.build().toHex();
 };
 
+const handleHalfSignEth = function(recoveryRequest, key, skipConfirm) {
+  return utils.halfSignEthTransaction(recoveryRequest.coin, recoveryRequest.txPrebuild, key);
+}
+
 const handleSignEthereum = function(recoveryRequest, key, skipConfirm) {
   const EthTx = require('ethereumjs-tx');
 
-  const transaction = new EthTx(recoveryRequest.tx);
+  const txHex = getTransactionHexFromRequest(recoveryRequest);
+  const transaction = new EthTx(txHex);
   const decimals = coinDecimals[recoveryRequest.coin];
 
   const customMessage = recoveryRequest.custom ? recoveryRequest.custom.message : 'None';
@@ -160,7 +185,7 @@ const handleSignEthereum = function(recoveryRequest, key, skipConfirm) {
 
   const backupKeyNode = getHDNodeAndVerify(key, recoveryRequest.backupKey);
 
-  const backupSigningKey = backupKeyNode.getKey().getPrivateKeyBuffer();
+  const backupSigningKey = backupKeyNode.keyPair.getPrivateKeyBuffer();
 
   transaction.sign(backupSigningKey);
 
@@ -173,8 +198,10 @@ const handleSignXrp = function(recoveryRequest, key, skipConfirm) {
   const rippleKeypairs = require('ripple-keypairs');
   const rippleParse = require('ripple-binary-codec');
 
+  const txHex = getTransactionHexFromRequest(recoveryRequest);
+
   const decimals = coinDecimals[recoveryRequest.coin];
-  const transaction = rippleParse.decode(recoveryRequest.txHex);
+  const transaction = rippleParse.decode(txHex);
   const customMessage = recoveryRequest.custom ? recoveryRequest.custom.message : 'None';
 
   const outputs = [{
@@ -193,9 +220,9 @@ const handleSignXrp = function(recoveryRequest, key, skipConfirm) {
 
   const backupAddress = rippleKeypairs.deriveAddress(backupKeyNode.keyPair.getPublicKeyBuffer().toString('hex'));
   const privateKeyHex = backupKeyNode.keyPair.getPrivateKeyBuffer().toString('hex');
-  const cosignedTx = utils.signXrpWithPrivateKey(recoveryRequest.txHex, privateKeyHex, { signAs: backupAddress });
+  const cosignedTx = utils.signXrpWithPrivateKey(txHex, privateKeyHex, { signAs: backupAddress });
 
-  return rippleApi.combine([ recoveryRequest.txHex, cosignedTx.signedTransaction ]).signedTransaction;
+  return rippleApi.combine([ txHex, cosignedTx.signedTransaction ]).signedTransaction;
 };
 
 const handleSignXlm = function(recoveryRequest, key, skipConfirm) {
@@ -209,7 +236,8 @@ const handleSignXlm = function(recoveryRequest, key, skipConfirm) {
 
   const decimals = coinDecimals[recoveryRequest.coin];
 
-  const transaction = new stellar.Transaction(recoveryRequest.tx);
+  const txHex = getTransactionHexFromRequest(recoveryRequest);
+  const transaction = new stellar.Transaction(txHex);
   const customMessage = recoveryRequest.custom ? recoveryRequest.custom.message : 'None';
 
   if (transaction.operations.length !== 1) {
@@ -252,7 +280,8 @@ const handleSignXlm = function(recoveryRequest, key, skipConfirm) {
 const handleSignErc20 = function(recoveryRequest, key, skipConfirm) {
   const EthTx = require('ethereumjs-tx');
 
-  const transaction = new EthTx(recoveryRequest.tx);
+  const txHex = getTransactionHexFromRequest(recoveryRequest);
+  const transaction = new EthTx(txHex);
 
   const customMessage = recoveryRequest.custom ? recoveryRequest.custom.message : 'None';
   const txData = transaction.data;
@@ -305,7 +334,29 @@ const parseKey = function(rawkey, coin, path) {
 
   }
   // if it doesn't have commas, we expect it is an xprv or xlmsecret properly formatted
-  return key;
+  if(path) {
+    let node = utxoLib.HDNode.fromPrivateKeyBuffer(Buffer.from(rawkey, 'hex'));
+    node = node.derivePath(path);
+    return node.toBase58();
+  }
+  return rawkey;
+}
+
+/**
+ Not all recoveryRequest files are formatted the same. Sometimes they have 'tx', 'txHex', or 'transactionHex'
+ This function gets and gets and returns the transaction hex in all of these cases
+ */
+const getTransactionHexFromRequest = function(recoveryRequest) {
+  if (recoveryRequest.txHex){
+    return recoveryRequest.txHex
+  }
+  if (recoveryRequest.transactionHex){
+    return recoveryRequest.transactionHex
+  }
+  if (recoveryRequest.tx){
+    return recoveryRequest.tx
+  }
+  throw new Error("The recovery request did not provide a transaction hex");
 }
 
 const handleSign = function(args) {
@@ -321,11 +372,15 @@ const handleSign = function(args) {
 
   const key = parseKey(args.key, coin, args.path);
 
-  let txHex;
+  let txHex, halfSignedInfo;
 
   switch (coin) {
     case 'eth': case 'teth':
-      txHex = handleSignEthereum(recoveryRequest, key, args.confirm);
+      if (recoveryRequest.txPrebuild) {
+        halfSignedInfo = handleHalfSignEth(recoveryRequest, key, args.confirm);
+      } else {
+        txHex = handleSignEthereum(recoveryRequest, key, args.confirm);
+      }
       break;
     case 'xrp': case 'txrp':
       txHex = handleSignXrp(recoveryRequest, key, args.confirm);
@@ -333,24 +388,40 @@ const handleSign = function(args) {
     case 'xlm': case'txlm':
       txHex = handleSignXlm(recoveryRequest, key, args.confirm);
       break;
-    case 'erc20':
-      txHex = handleSignErc20(recoveryRequest, key, args.confirm);
+    case 'erc20': case 'terc20': case 'terc': case 'erc':
+      if (recoveryRequest.txPrebuild) {
+        halfSignedInfo = handleHalfSignEth(recoveryRequest, key, args.confirm);
+      } else {
+        txHex = handleSignErc20(recoveryRequest, key, args.confirm);
+      }
       break;
     default:
       txHex = handleSignUtxo(recoveryRequest, key, args.confirm);
       break;
   }
 
-  console.log(`Signed transaction hex: ${txHex}`);
+  if(txHex) {
+    console.log(`Signed transaction hex: ${txHex}`);
+  }
 
   const filename = file.replace(/\.[^/.]+$/, '') + '.signed.json';
   console.log(`Writing signed transaction to file: ${filename}`);
 
-  const finalRecovery = _.pick(recoveryRequest, ['backupKey', 'coin', 'recoveryAmount']);
-  finalRecovery.txHex = txHex;
+  let finalRecovery;
+  
+  if (txHex) {
+    finalRecovery = _.pick(recoveryRequest, ['backupKey', 'coin', 'recoveryAmount']);
+    finalRecovery.txHex = txHex;
+  } else {
+    finalRecovery = halfSignedInfo;
+  }
 
-  fs.writeFileSync(filename, JSON.stringify(finalRecovery, null, 2));
-  console.log('Done');
+  const fileStr = JSON.stringify(finalRecovery, null, 2);
+  if(!args.noWrite) {
+    fs.writeFileSync(filename, fileStr);
+    console.log('Done');
+  }
+  return finalRecovery;
 };
 
 module.exports = { handleSign, handleSignUtxo, handleSignEthereum, handleSignXrp, handleSignXlm, handleSignErc20, parseKey };
